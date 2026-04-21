@@ -1,0 +1,56 @@
+.metric-table__wrapper {
+  overflow-x: auto;
+}
+
+.metric-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.metric-table th,
+.metric-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.metric-table th {
+  font-weight: 600;
+  color: #666;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: #fafafa;
+}
+
+.metric-table th.num,
+.metric-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-table th.center,
+.metric-table td.center {
+  text-align: center;
+}
+
+.metric-table tbody tr:hover {
+  background: #f8f9ff;
+}
+
+.metric-table__empty {
+  color: #999;
+  font-size: 13px;
+  text-align: center;
+  padding: 20px;
+}
+
+.sig-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}

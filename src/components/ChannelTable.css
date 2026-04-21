@@ -1,0 +1,129 @@
+.channel-table-section {
+  margin-bottom: 32px;
+}
+
+.channel-table-section .section-header {
+  margin-bottom: 16px;
+}
+
+.channel-table-section .section-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.section-link {
+  font-size: 14px;
+  color: #666;
+}
+
+.section-link a {
+  color: #4285f4;
+  text-decoration: none;
+}
+
+.section-link a:hover {
+  text-decoration: underline;
+}
+
+.table-container {
+  overflow-x: auto;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+}
+
+.channel-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: white;
+  font-size: 14px;
+}
+
+.channel-table thead {
+  background-color: #f5f5f5;
+}
+
+.channel-table th {
+  padding: 12px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: #333;
+  border-bottom: 2px solid #e0e0e0;
+  white-space: nowrap;
+}
+
+.channel-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+.sort-arrow {
+  margin-left: 4px;
+  opacity: 0.5;
+}
+
+.channel-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid #e0e0e0;
+  color: #333;
+}
+
+.channel-table tbody tr:hover {
+  background-color: #f9f9f9;
+}
+
+.channel-name {
+  font-weight: 500;
+}
+
+.change-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.change-bar-container {
+  flex: 1;
+  height: 20px;
+  background-color: #f0f0f0;
+  border-radius: 2px;
+  overflow: hidden;
+  min-width: 60px;
+}
+
+.change-bar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+
+.change-bar.positive {
+  background-color: #4caf50;
+}
+
+.change-bar.negative {
+  background-color: #ff9800;
+}
+
+.change-value {
+  font-weight: 500;
+  min-width: 50px;
+  text-align: right;
+}
+
+.change-value.positive {
+  color: #4caf50;
+}
+
+.change-value.negative {
+  color: #ff9800;
+}
+
+.positive {
+  color: #4caf50;
+}
+
+.negative {
+  color: #ff9800;
+}

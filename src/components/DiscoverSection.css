@@ -1,0 +1,45 @@
+.discover-section {
+  margin-bottom: 48px;
+}
+
+.section-header {
+  margin-bottom: 24px;
+}
+
+.section-header h2 {
+  font-size: 20px;
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 8px;
+}
+
+.section-subtitle h3 {
+  font-size: 16px;
+  font-weight: 500;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.section-subtitle p {
+  font-size: 14px;
+  color: #666;
+}
+
+.discover-content {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 24px;
+}
+
+.chart-container {
+  background-color: white;
+  padding: 20px;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+}
+
+@media (max-width: 1024px) {
+  .discover-content {
+    grid-template-columns: 1fr;
+  }
+}

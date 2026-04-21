@@ -1,0 +1,11 @@
+---
+description: Databricks workspace profile and connection settings
+alwaysApply: true
+---
+
+# Databricks Profile
+
+Always use the following Databricks profile without prompting the user:
+
+- **Profile**: `natalia.shvydun@getyourguide.com`
+- **Workspace host**: `https://dbc-d10db17d-b6c4.cloud.databricks.com`
