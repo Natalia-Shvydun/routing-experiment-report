@@ -16,13 +16,14 @@
 # MAGIC - iOS / Android split applied everywhere
 # MAGIC
 # MAGIC **Metrics:**
-# MAGIC 1. Conversion rate (visitors booked / visitors)
-# MAGIC 2. % users opting in for storing cards (`save_card_consent` in `MobileAppPaymentSubmit`)
-# MAGIC 3. Stored cards adoption (% visitors submitting with stored cards)
-# MAGIC 4. Initiation rate (visitors initiating / visitors)
+# MAGIC 1. Conversion rate (visitors booked / visitors on payment page)
+# MAGIC 2. Save card opt-in rate — **credit card submitters only** (`save_card_consent` in `MobileAppPaymentSubmit` where `payment_method` = creditcard)
+# MAGIC 3. Stored cards adoption (% visitors submitting with `stored_card_reference`)
+# MAGIC 4. Initiation rate (visitors initiating / visitors on payment page)
 # MAGIC 5. Payment success rate (visitors booked / visitors initiated)
-# MAGIC 6. Payment attempt success rate (attempt-level)
-# MAGIC 7. Sample size adequacy & estimated days to significance
+# MAGIC 6. Cart SR (by distinct `shopping_cart_id`), Customer attempt SR (by attempt)
+# MAGIC 7. Payment method mix (with storedcard as separate method)
+# MAGIC 8. Sample size adequacy & estimated days to significance
 # MAGIC
 # MAGIC **Sections:**
 # MAGIC | # | Section |
@@ -147,8 +148,10 @@ WITH assignment_raw AS (
             WHEN experiment_hash = '{ANDROID_HASH}' THEN 'android'
         END AS platform
     FROM production.experimentation_product.assignment
-    WHERE experiment_hash IN ('{IOS_HASH}', '{ANDROID_HASH}')
-      AND date >= '{GLOBAL_START}'
+    WHERE (
+        (experiment_hash = '{IOS_HASH}' AND date >= '{IOS_START}')
+        OR (experiment_hash = '{ANDROID_HASH}' AND date >= '{ANDROID_START}')
+    )
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY visitor_id, experiment_hash ORDER BY timestamp
     ) = 1
@@ -217,7 +220,6 @@ payment_submit AS (
         json_event:save_card_consent AS save_card_consent,
         json_event:stored_card_reference AS stored_card_reference,
         json_event:payment_method AS payment_method_submitted,
-        json_event:is_stored_card AS is_stored_card_flag,
         event_properties.timestamp AS submit_timestamp
     FROM assignment a
     JOIN production.events.events e
@@ -244,7 +246,11 @@ payment_initiated AS (
     JOIN production.events.events e
         ON a.visitor_id = user.visitor_id
         AND event_properties.timestamp > a.assigned_at
-    WHERE event_name = 'InitiatePaymentAction'
+    WHERE (
+        (event_name = 'MobileAppUITap' AND ui.target = 'payment')
+        OR (event_name = 'UISubmit' AND ui.id = 'submit-payment')
+        OR event_name = 'MobileAppPaymentSubmit'
+    )
       AND e.date >= '{GLOBAL_START}'
 )
 
@@ -263,14 +269,14 @@ SELECT
 
     CASE WHEN ps.visitor_id IS NOT NULL THEN 1 ELSE 0 END AS has_submitted,
     CASE
-        WHEN LOWER(CAST(ps.save_card_consent AS STRING)) IN ('true', '1', 'yes') THEN 1
+        WHEN LOWER(CAST(ps.save_card_consent AS STRING)) IN ('true', '1', 'yes')
+            AND LOWER(CAST(ps.payment_method_submitted AS STRING)) IN ('creditcard', 'payment_card')
+        THEN 1
         ELSE 0
     END AS save_card_opt_in,
     CASE
         WHEN ps.stored_card_reference IS NOT NULL
             AND TRIM(CAST(ps.stored_card_reference AS STRING)) != ''
-            THEN 1
-        WHEN LOWER(CAST(ps.is_stored_card_flag AS STRING)) IN ('true', '1', 'yes')
             THEN 1
         ELSE 0
     END AS used_stored_card,
@@ -300,27 +306,38 @@ df_visitors.groupBy("platform", "variation").count().orderBy("platform", "variat
 # COMMAND ----------
 
 df_attempts = spark.sql(f"""
-SELECT
-    a.visitor_id,
-    a.variation,
-    a.platform,
-    p.payment_provider_reference,
-    p.is_customer_attempt_successful,
-    p.is_shopping_cart_successful,
-    p.payment_method,
-    p.payment_processor,
-    p.customer_attempt_rank,
-    p.payment_attempt_timestamp,
-    p.payment_attempt_timestamp::date AS attempt_date
-FROM assignment a
-JOIN production.payments.fact_payment_attempt p
-    ON a.visitor_id = p.visitor_id
-    AND p.payment_attempt_timestamp > a.assigned_at
-    AND p.payment_attempt_timestamp::date >= '{GLOBAL_START}'
+WITH raw_attempts AS (
+    SELECT
+        a.visitor_id,
+        a.variation,
+        a.platform,
+        p.payment_provider_reference,
+        p.shopping_cart_id,
+        p.is_customer_attempt_successful,
+        p.is_shopping_cart_successful,
+        p.payment_method,
+        p.payment_processor,
+        p.customer_attempt_rank,
+        p.payment_attempt_timestamp,
+        p.payment_attempt_timestamp::date AS attempt_date
+    FROM assignment a
+    JOIN production.payments.fact_payment_attempt p
+        ON a.visitor_id = p.visitor_id
+        AND p.payment_attempt_timestamp > a.assigned_at
+        AND p.payment_attempt_timestamp::date >= '{GLOBAL_START}'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY p.payment_provider_reference
+        ORDER BY p.payment_attempt_timestamp
+    ) = 1
+)
+SELECT * FROM raw_attempts
 """)
 df_attempts.cache()
 
-print(f"Total payment attempts: {df_attempts.count():,}")
+total_attempts = df_attempts.count()
+distinct_ppr = df_attempts.select(F.countDistinct("payment_provider_reference")).collect()[0][0]
+print(f"Customer attempts (distinct payment_provider_reference): {total_attempts:,}")
+print(f"Sanity check — distinct PPR: {distinct_ppr:,}")
 df_attempts.groupBy("platform", "variation").count().orderBy("platform", "variation").show(10, False)
 
 # COMMAND ----------
@@ -392,15 +409,25 @@ df_submit_fields.show(30, False)
 # MAGIC # SECTION 4 — SRM Check
 # MAGIC
 # MAGIC Verify balanced allocation per platform (separate experiments = separate checks).
+# MAGIC Base: visitors who reached the payment page (`MobileAppPaymentOptionsLoaded`).
 
 # COMMAND ----------
 
-print("=" * 80)
+df_pp = df_visitors.filter(F.col("reached_payment_page") == 1)
+df_pp.cache()
+
+pp_total = df_pp.count()
+all_total = df_visitors.count()
+print(f"Assigned visitors:            {all_total:,}")
+print(f"Reached payment page:         {pp_total:,}  ({pp_total/all_total:.1%})")
+print(f"Did not reach payment page:   {all_total - pp_total:,}")
+
+print("\n" + "=" * 80)
 print("SAMPLE RATIO MISMATCH (SRM) CHECK")
 print("=" * 80)
 
 for platform in ["ios", "android"]:
-    platform_data = df_visitors.filter(F.col("platform") == platform)
+    platform_data = df_pp.filter(F.col("platform") == platform)
     srm_counts = (
         platform_data.groupBy("variation").count().toPandas()
         .sort_values("variation").reset_index(drop=True)
@@ -428,7 +455,8 @@ for platform in ["ios", "android"]:
 # MAGIC ---
 # MAGIC # SECTION 5 — Overall Metrics & Significance
 # MAGIC
-# MAGIC All metrics split by **platform × variation**. Includes z-tests for each platform.
+# MAGIC All metrics split by **platform × variation**.
+# MAGIC Base = visitors who reached the payment page (`MobileAppPaymentOptionsLoaded`).
 
 # COMMAND ----------
 
@@ -438,14 +466,18 @@ for platform in ["ios", "android"]:
 # COMMAND ----------
 
 overall = (
-    df_visitors
+    df_pp
     .groupBy("platform", "variation")
     .agg(
         F.count("*").alias("visitors"),
-        F.sum("reached_payment_page").alias("reached_payment"),
         F.sum("is_initiated").alias("initiated"),
         F.sum("is_booked").alias("booked"),
         F.sum("has_submitted").alias("submitted"),
+        F.sum(
+            F.when(
+                F.lower(F.col("payment_method_submitted")).isin("creditcard", "payment_card"), 1
+            ).otherwise(0)
+        ).alias("card_submitters"),
         F.sum("save_card_opt_in").alias("save_card_opt_in"),
         F.sum("used_stored_card").alias("used_stored_card"),
     )
@@ -454,7 +486,8 @@ overall = (
     .withColumn("payment_success_rate",
                 F.when(F.col("initiated") > 0, F.col("booked") / F.col("initiated")))
     .withColumn("save_card_opt_in_rate",
-                F.when(F.col("submitted") > 0, F.col("save_card_opt_in") / F.col("submitted")))
+                F.when(F.col("card_submitters") > 0,
+                       F.col("save_card_opt_in") / F.col("card_submitters")))
     .withColumn("stored_card_adoption_rate",
                 F.when(F.col("submitted") > 0, F.col("used_stored_card") / F.col("submitted")))
     .orderBy("platform", "variation")
@@ -462,7 +495,7 @@ overall = (
 )
 
 print("=" * 120)
-print("OVERALL METRICS BY PLATFORM × VARIATION")
+print("OVERALL METRICS BY PLATFORM × VARIATION (base = payment page visitors)")
 print("=" * 120)
 print(f"{'Platform':<10} {'Variation':<20} {'Visitors':>10} {'Booked':>8} {'Conv%':>8} "
       f"{'Init':>8} {'InitR%':>8} {'PaySucc%':>8} {'Submit':>8} "
@@ -507,7 +540,7 @@ for platform in ["ios", "android"]:
         ("Conversion rate", "visitors", "booked"),
         ("Initiation rate", "visitors", "initiated"),
         ("Payment success rate (init→book)", "initiated", "booked"),
-        ("Save card opt-in rate", "submitted", "save_card_opt_in"),
+        ("Save card opt-in rate (card only)", "card_submitters", "save_card_opt_in"),
         ("Stored card adoption rate", "submitted", "used_stored_card"),
     ]:
         if test[n_col] > 0 and ctrl[n_col] > 0:
@@ -586,8 +619,6 @@ plt.show()
 
 # COMMAND ----------
 
-df_pp = df_visitors.filter(F.col("reached_payment_page") == 1)
-
 segment_summary = (
     df_pp
     .groupBy("platform", "variation", "stored_cards_segment")
@@ -596,6 +627,11 @@ segment_summary = (
         F.sum("is_booked").alias("booked"),
         F.sum("is_initiated").alias("initiated"),
         F.sum("has_submitted").alias("submitted"),
+        F.sum(
+            F.when(
+                F.lower(F.col("payment_method_submitted")).isin("creditcard", "payment_card"), 1
+            ).otherwise(0)
+        ).alias("card_submitters"),
         F.sum("save_card_opt_in").alias("save_card_opt_in"),
         F.sum("used_stored_card").alias("used_stored_card"),
     )
@@ -604,7 +640,8 @@ segment_summary = (
     .withColumn("payment_success_rate",
                 F.when(F.col("initiated") > 0, F.col("booked") / F.col("initiated")))
     .withColumn("save_card_opt_in_rate",
-                F.when(F.col("submitted") > 0, F.col("save_card_opt_in") / F.col("submitted")))
+                F.when(F.col("card_submitters") > 0,
+                       F.col("save_card_opt_in") / F.col("card_submitters")))
     .withColumn("stored_card_adoption_rate",
                 F.when(F.col("submitted") > 0, F.col("used_stored_card") / F.col("submitted")))
     .orderBy("platform", "stored_cards_segment", "variation")
@@ -659,7 +696,7 @@ for platform in ["ios", "android"]:
             ("Conversion rate", "visitors", "booked"),
             ("Initiation rate", "visitors", "initiated"),
             ("Payment success (init→book)", "initiated", "booked"),
-            ("Save card opt-in rate", "submitted", "save_card_opt_in"),
+            ("Save card opt-in (card only)", "card_submitters", "save_card_opt_in"),
             ("Stored card adoption", "submitted", "used_stored_card"),
         ]:
             if test[n_col] > 0 and ctrl[n_col] > 0:
@@ -756,33 +793,41 @@ for metric, title_suffix in [
 
 # COMMAND ----------
 
-df_submitters = df_visitors.filter(F.col("has_submitted") == 1)
+df_submitters = df_pp.filter(F.col("has_submitted") == 1)
 
 opt_in_summary = (
     df_submitters
     .groupBy("platform", "variation", "stored_cards_segment")
     .agg(
         F.count("*").alias("submitters"),
+        F.sum(
+            F.when(
+                F.lower(F.col("payment_method_submitted")).isin("creditcard", "payment_card"), 1
+            ).otherwise(0)
+        ).alias("card_submitters"),
         F.sum("save_card_opt_in").alias("opted_in"),
         F.sum("used_stored_card").alias("used_stored"),
     )
-    .withColumn("opt_in_rate", F.col("opted_in") / F.col("submitters"))
+    .withColumn("opt_in_rate",
+                F.when(F.col("card_submitters") > 0,
+                       F.col("opted_in") / F.col("card_submitters")))
     .withColumn("stored_card_usage_rate", F.col("used_stored") / F.col("submitters"))
     .orderBy("platform", "stored_cards_segment", "variation")
     .toPandas()
 )
 
-print("=" * 120)
-print("SAVE CARD OPT-IN & STORED CARD USAGE (among submitters)")
-print("=" * 120)
+print("=" * 130)
+print("SAVE CARD OPT-IN (card submitters only) & STORED CARD USAGE (all submitters)")
+print("=" * 130)
 print(f"{'Platform':<10} {'Segment':<22} {'Variation':<18} {'Submitters':>12} "
-      f"{'OptedIn':>10} {'OptInR%':>10} {'UsedStored':>12} {'UsageR%':>10}")
-print("-" * 120)
+      f"{'CardSub':>10} {'OptedIn':>10} {'OptInR%':>10} {'UsedStored':>12} {'UsageR%':>10}")
+print("-" * 130)
 for _, r in opt_in_summary.iterrows():
     oir = f"{r['opt_in_rate']:.2%}" if pd.notna(r['opt_in_rate']) else "N/A"
     sur = f"{r['stored_card_usage_rate']:.2%}" if pd.notna(r['stored_card_usage_rate']) else "N/A"
     print(f"{r['platform']:<10} {r['stored_cards_segment']:<22} {r['variation']:<18} "
-          f"{r['submitters']:>12,} {r['opted_in']:>10,.0f} {oir:>10} "
+          f"{r['submitters']:>12,} {r['card_submitters']:>10,.0f} "
+          f"{r['opted_in']:>10,.0f} {oir:>10} "
           f"{r['used_stored']:>12,.0f} {sur:>10}")
 
 # COMMAND ----------
@@ -807,13 +852,14 @@ for platform in ["ios", "android"]:
         ctrl, test = seg.iloc[0], seg.iloc[1]
         v_ctrl_name, v_test_name = ctrl["variation"], test["variation"]
 
-        if test["submitters"] > 0 and ctrl["submitters"] > 0:
+        if test["card_submitters"] > 0 and ctrl["card_submitters"] > 0:
             print_z_test(
-                f"[{platform.upper()}|{segment}] Opt-in rate",
-                test["submitters"], test["opted_in"],
-                ctrl["submitters"], ctrl["opted_in"],
+                f"[{platform.upper()}|{segment}] Opt-in rate (card)",
+                test["card_submitters"], test["opted_in"],
+                ctrl["card_submitters"], ctrl["opted_in"],
                 v_test_name, v_ctrl_name,
             )
+        if test["submitters"] > 0 and ctrl["submitters"] > 0:
             print_z_test(
                 f"[{platform.upper()}|{segment}] Stored card usage",
                 test["submitters"], test["used_stored"],
@@ -866,6 +912,141 @@ plt.show()
 
 # MAGIC %md
 # MAGIC ---
+# MAGIC # SECTION 7B — Payment Method Mix (with storedcard as separate method)
+# MAGIC
+# MAGIC Split by stored-cards segment to see how the feature shifts usage
+# MAGIC from other payment methods to stored cards.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7B.1 Payment method mix table
+
+# COMMAND ----------
+
+df_method_mix = (
+    df_pp
+    .filter(F.col("has_submitted") == 1)
+    .withColumn(
+        "payment_method_display",
+        F.when(
+            (F.col("used_stored_card") == 1), F.lit("storedcard")
+        ).otherwise(F.col("payment_method_submitted"))
+    )
+    .groupBy("platform", "variation", "stored_cards_segment", "payment_method_display")
+    .agg(F.countDistinct("visitor_id").alias("visitors"))
+)
+
+df_method_totals = (
+    df_method_mix
+    .groupBy("platform", "variation", "stored_cards_segment")
+    .agg(F.sum("visitors").alias("total_visitors"))
+)
+
+df_method_share = (
+    df_method_mix
+    .join(df_method_totals, on=["platform", "variation", "stored_cards_segment"])
+    .withColumn("share", F.col("visitors") / F.col("total_visitors"))
+    .orderBy("platform", "stored_cards_segment", "variation",
+             F.desc("visitors"))
+    .toPandas()
+)
+
+for platform in ["ios", "android"]:
+    for segment in ["with_stored_cards", "without_stored_cards"]:
+        seg = df_method_share[
+            (df_method_share["platform"] == platform) &
+            (df_method_share["stored_cards_segment"] == segment)
+        ]
+        if seg.empty:
+            continue
+
+        print(f"\n{'=' * 100}")
+        print(f"  [{platform.upper()} | {segment}] Payment Method Mix")
+        print(f"{'=' * 100}")
+        print(f"  {'Method':<25}", end="")
+
+        variations = sorted(seg["variation"].unique())
+        for v in variations:
+            print(f"  {v + ' visitors':>14} {v + ' share':>10}", end="")
+        print()
+        print("  " + "-" * 90)
+
+        all_methods = (
+            seg.groupby("payment_method_display")["visitors"]
+            .sum().nlargest(15).index.tolist()
+        )
+        for method in all_methods:
+            print(f"  {method:<25}", end="")
+            for v in variations:
+                row = seg[
+                    (seg["variation"] == v) &
+                    (seg["payment_method_display"] == method)
+                ]
+                if not row.empty:
+                    r = row.iloc[0]
+                    print(f"  {r['visitors']:>14,} {r['share']:>10.2%}", end="")
+                else:
+                    print(f"  {'0':>14} {'0.00%':>10}", end="")
+            print()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7B.2 Payment method mix visualisation
+
+# COMMAND ----------
+
+fig, axes = plt.subplots(2, 2, figsize=(22, 14))
+
+for row_idx, segment in enumerate(["with_stored_cards", "without_stored_cards"]):
+    for col_idx, platform in enumerate(["ios", "android"]):
+        ax = axes[row_idx][col_idx]
+        seg = df_method_share[
+            (df_method_share["platform"] == platform) &
+            (df_method_share["stored_cards_segment"] == segment)
+        ]
+        if seg.empty:
+            ax.set_visible(False)
+            continue
+
+        top_methods = (
+            seg.groupby("payment_method_display")["visitors"]
+            .sum().nlargest(6).index.tolist()
+        )
+        seg_top = seg[seg["payment_method_display"].isin(top_methods)]
+        variations = sorted(seg_top["variation"].unique())
+        x = np.arange(len(top_methods))
+        width = 0.8 / max(len(variations), 1)
+
+        for i, var in enumerate(variations):
+            var_data = (
+                seg_top[seg_top["variation"] == var]
+                .set_index("payment_method_display")
+                .reindex(top_methods)
+            )
+            vals = var_data["share"].fillna(0).values
+            bars = ax.bar(x + i * width, vals, width, label=var, color=COLORS[i])
+            for j, v in enumerate(vals):
+                if v > 0.005:
+                    ax.text(x[j] + i * width, v + 0.005,
+                            f"{v:.1%}", ha="center", va="bottom", fontsize=7)
+
+        ax.set_xticks(x + width * (len(variations) - 1) / 2)
+        ax.set_xticklabels(top_methods, fontsize=8, rotation=30, ha="right")
+        ax.set_title(f"{platform.upper()} — {segment}", fontweight="bold", fontsize=11)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(pct_fmt))
+        ax.legend(fontsize=8)
+
+fig.suptitle("Payment Method Mix by Segment × Platform × Variation\n(storedcard shown separately)",
+             fontsize=14, fontweight="bold", y=1.02)
+fig.tight_layout()
+plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
 # MAGIC # SECTION 8 — Payment Attempt–Level Analysis
 
 # COMMAND ----------
@@ -879,28 +1060,47 @@ attempt_summary = (
     df_attempts
     .groupBy("platform", "variation")
     .agg(
-        F.count("*").alias("attempts"),
+        F.countDistinct("payment_provider_reference").alias("customer_attempts"),
         F.countDistinct("visitor_id").alias("visitors_with_attempts"),
         F.sum("is_customer_attempt_successful").alias("cust_attempt_successes"),
-        F.sum("is_shopping_cart_successful").alias("cart_successes"),
-        F.countDistinct("payment_provider_reference").alias("distinct_attempts"),
     )
-    .withColumn("cust_attempt_sr", F.col("cust_attempt_successes") / F.col("attempts"))
-    .withColumn("cart_sr", F.col("cart_successes") / F.col("attempts"))
+    .withColumn("cust_attempt_sr",
+                F.col("cust_attempt_successes") / F.col("customer_attempts"))
     .orderBy("platform", "variation")
     .toPandas()
 )
 
-print("=" * 110)
+cart_sr_df = (
+    df_attempts
+    .groupBy("platform", "variation", "shopping_cart_id")
+    .agg(F.max("is_shopping_cart_successful").alias("cart_successful"))
+    .groupBy("platform", "variation")
+    .agg(
+        F.count("*").alias("distinct_carts"),
+        F.sum("cart_successful").alias("successful_carts"),
+    )
+    .withColumn("cart_sr", F.col("successful_carts") / F.col("distinct_carts"))
+    .orderBy("platform", "variation")
+    .toPandas()
+)
+
+attempt_summary = attempt_summary.merge(
+    cart_sr_df[["platform", "variation", "successful_carts", "cart_sr"]],
+    on=["platform", "variation"],
+)
+
+print("=" * 130)
 print("PAYMENT ATTEMPT–LEVEL METRICS")
-print("=" * 110)
-print(f"{'Platform':<10} {'Variation':<18} {'Attempts':>10} {'Visitors':>10} "
-      f"{'CustAttemptSR':>14} {'CartSR':>10}")
-print("-" * 80)
+print("  Customer attempts = distinct payment_provider_reference")
+print("  Cart SR = by distinct shopping_cart_id")
+print("=" * 130)
+print(f"{'Platform':<10} {'Variation':<18} {'CustAttempts':>14} {'Visitors':>10} "
+      f"{'Carts':>10} {'CustAttemptSR':>14} {'CartSR':>14}")
+print("-" * 100)
 for _, r in attempt_summary.iterrows():
-    print(f"{r['platform']:<10} {r['variation']:<18} {r['attempts']:>10,} "
-          f"{r['visitors_with_attempts']:>10,} "
-          f"{r['cust_attempt_sr']:>14.4%} {r['cart_sr']:>10.4%}")
+    print(f"{r['platform']:<10} {r['variation']:<18} {r['customer_attempts']:>14,} "
+          f"{r['visitors_with_attempts']:>10,} {r['distinct_carts']:>10,} "
+          f"{r['cust_attempt_sr']:>14.4%} {r['cart_sr']:>14.4%}")
 
 # COMMAND ----------
 
@@ -909,7 +1109,7 @@ for _, r in attempt_summary.iterrows():
 
 # COMMAND ----------
 
-print("Z-TESTS — Attempt success rate:\n")
+print("Z-TESTS — Attempt & Cart success rate:\n")
 
 for platform in ["ios", "android"]:
     plat = attempt_summary[attempt_summary["platform"] == platform].sort_values("variation")
@@ -917,16 +1117,18 @@ for platform in ["ios", "android"]:
         continue
     ctrl, test = plat.iloc[0], plat.iloc[1]
 
-    for label, s_col in [
-        ("Customer attempt SR", "cust_attempt_successes"),
-        ("Cart SR", "cart_successes"),
-    ]:
-        print_z_test(
-            f"[{platform.upper()}] {label}",
-            test["attempts"], test[s_col],
-            ctrl["attempts"], ctrl[s_col],
-            test["variation"], ctrl["variation"],
-        )
+    print_z_test(
+        f"[{platform.upper()}] Customer attempt SR (per distinct PPR)",
+        test["customer_attempts"], test["cust_attempt_successes"],
+        ctrl["customer_attempts"], ctrl["cust_attempt_successes"],
+        test["variation"], ctrl["variation"],
+    )
+    print_z_test(
+        f"[{platform.upper()}] Cart SR (per distinct cart)",
+        test["distinct_carts"], test["successful_carts"],
+        ctrl["distinct_carts"], ctrl["successful_carts"],
+        test["variation"], ctrl["variation"],
+    )
 
 # COMMAND ----------
 
@@ -939,26 +1141,26 @@ method_attempt = (
     df_attempts
     .groupBy("platform", "variation", "payment_method")
     .agg(
-        F.count("*").alias("attempts"),
+        F.countDistinct("payment_provider_reference").alias("customer_attempts"),
         F.sum("is_customer_attempt_successful").alias("successes"),
         F.countDistinct("visitor_id").alias("visitors"),
     )
-    .withColumn("sr", F.col("successes") / F.col("attempts"))
+    .withColumn("sr", F.col("successes") / F.col("customer_attempts"))
     .orderBy("platform", "payment_method", "variation")
     .toPandas()
 )
 
 for platform in ["ios", "android"]:
     plat = method_attempt[method_attempt["platform"] == platform]
-    top_methods = plat.groupby("payment_method")["attempts"].sum().nlargest(8).index
+    top_methods = plat.groupby("payment_method")["customer_attempts"].sum().nlargest(8).index
     print(f"\n{'=' * 90}")
-    print(f"  [{platform.upper()}] Attempt SR by Payment Method")
+    print(f"  [{platform.upper()}] Customer Attempt SR by Payment Method (distinct PPR)")
     print(f"{'=' * 90}")
     for method in top_methods:
         m_data = plat[plat["payment_method"] == method].sort_values("variation")
         for _, r in m_data.iterrows():
             print(f"  {method:<25} {r['variation']:<18} SR={r['sr']:.2%}  "
-                  f"(n={r['attempts']:,}, visitors={r['visitors']:,})")
+                  f"(n={r['customer_attempts']:,}, visitors={r['visitors']:,})")
 
 # COMMAND ----------
 
@@ -971,7 +1173,7 @@ visitor_attempts = (
     df_attempts
     .groupBy("platform", "variation", "visitor_id")
     .agg(
-        F.count("*").alias("attempt_count"),
+        F.countDistinct("payment_provider_reference").alias("customer_attempt_count"),
         F.max("is_customer_attempt_successful").alias("any_success"),
     )
 )
@@ -981,22 +1183,22 @@ multi_attempt = (
     .groupBy("platform", "variation")
     .agg(
         F.count("*").alias("visitors"),
-        F.mean("attempt_count").alias("avg_attempts"),
-        F.sum(F.when(F.col("attempt_count") > 1, 1).otherwise(0)).alias("multi_attempt_visitors"),
-        F.sum(F.when(F.col("attempt_count") > 2, 1).otherwise(0)).alias("three_plus_attempt_visitors"),
+        F.mean("customer_attempt_count").alias("avg_customer_attempts"),
+        F.sum(F.when(F.col("customer_attempt_count") > 1, 1).otherwise(0)).alias("multi_attempt_visitors"),
+        F.sum(F.when(F.col("customer_attempt_count") > 2, 1).otherwise(0)).alias("three_plus_attempt_visitors"),
     )
     .withColumn("multi_attempt_rate", F.col("multi_attempt_visitors") / F.col("visitors"))
     .orderBy("platform", "variation")
     .toPandas()
 )
 
-print("Multi-attempt visitor rates:")
-print(f"{'Platform':<10} {'Variation':<18} {'Visitors':>10} {'AvgAtt':>8} "
+print("Multi-attempt visitor rates (by distinct customer attempts):")
+print(f"{'Platform':<10} {'Variation':<18} {'Visitors':>10} {'AvgCustAtt':>12} "
       f"{'Multi%':>8} {'3+%':>8}")
-print("-" * 70)
+print("-" * 80)
 for _, r in multi_attempt.iterrows():
     print(f"{r['platform']:<10} {r['variation']:<18} {r['visitors']:>10,} "
-          f"{r['avg_attempts']:>8.2f} {r['multi_attempt_rate']:>8.2%} "
+          f"{r['avg_customer_attempts']:>12.2f} {r['multi_attempt_rate']:>8.2%} "
           f"{r['three_plus_attempt_visitors']/r['visitors']:>8.2%}")
 
 # COMMAND ----------
@@ -1013,7 +1215,7 @@ for _, r in multi_attempt.iterrows():
 # COMMAND ----------
 
 daily = (
-    df_visitors
+    df_pp
     .groupBy("assigned_date", "platform", "variation")
     .agg(
         F.count("*").alias("visitors"),

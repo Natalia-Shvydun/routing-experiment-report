@@ -70,7 +70,12 @@ SELECT
   p.is_three_ds_passed,
   p.sent_to_issuer,
   p.payment_attempt_timestamp,
-  p.amount
+  p.amount,
+  p.bin_account_funding_type,
+  p.bin_product_usage_type,
+  p.bin_network,
+  p.bin_issuer_name,
+  p.high_risk
 FROM assignment a
 JOIN production.payments.fact_payment_attempt p
   ON a.visitor_id = p.visitor_id
@@ -135,7 +140,14 @@ test_prep = test_3ds.withColumn(
     "attempt_hour", F.hour("payment_attempt_timestamp")
 )
 
-MATCH_COLS = ["payment_method_variant", "currency", "attempt_date", "amount_bucket"]
+MATCH_COLS = [
+    "payment_method_variant",
+    "currency",
+    "attempt_date",
+    "amount_bucket",
+    "bin_account_funding_type",
+    "high_risk",
+]
 
 pairs = ctrl_prep.alias("c").join(
     test_prep.alias("t"),
@@ -151,6 +163,12 @@ pairs = ctrl_prep.alias("c").join(
     F.col("c.attempt_date"),
     F.col("c.amount").alias("ctrl_amount"),
     F.col("t.amount").alias("test_amount"),
+    F.col("c.bin_account_funding_type").alias("account_funding_type"),
+    F.col("c.bin_product_usage_type").alias("ctrl_product_usage"),
+    F.col("t.bin_product_usage_type").alias("test_product_usage"),
+    F.col("c.bin_issuer_name").alias("ctrl_issuer"),
+    F.col("t.bin_issuer_name").alias("test_issuer"),
+    F.col("c.high_risk").alias("high_risk"),
     F.col("c.payment_processor").alias("ctrl_processor"),
     F.col("t.payment_processor").alias("test_processor"),
     F.col("c.fraud_pre_auth_result").alias("ctrl_fraud"),
@@ -174,7 +192,54 @@ pairs = ctrl_prep.alias("c").join(
 ).filter(F.col("_rn") == 1).drop("_rn")
 
 pair_count = pairs.count()
-print(f"Matched pairs: {pair_count:,}")
+print(f"Matched pairs (strict — same card type + risk flag): {pair_count:,}")
+
+if pair_count == 0:
+    print("\nFallback: relaxing match to exclude high_risk...")
+    MATCH_COLS_RELAXED = ["payment_method_variant", "currency", "attempt_date", "amount_bucket", "bin_account_funding_type"]
+    pairs = ctrl_prep.alias("c").join(
+        test_prep.alias("t"),
+        on=[F.col(f"c.{col}") == F.col(f"t.{col}") for col in MATCH_COLS_RELAXED],
+        how="inner"
+    ).select(
+        F.col("c.payment_provider_reference").alias("ctrl_ref"),
+        F.col("t.payment_provider_reference").alias("test_ref"),
+        F.col("c.visitor_id").alias("ctrl_visitor"),
+        F.col("t.visitor_id").alias("test_visitor"),
+        F.col("c.payment_method_variant").alias("card_network"),
+        F.col("c.currency"),
+        F.col("c.attempt_date"),
+        F.col("c.amount").alias("ctrl_amount"),
+        F.col("t.amount").alias("test_amount"),
+        F.col("c.bin_account_funding_type").alias("account_funding_type"),
+        F.col("c.bin_product_usage_type").alias("ctrl_product_usage"),
+        F.col("t.bin_product_usage_type").alias("test_product_usage"),
+        F.col("c.bin_issuer_name").alias("ctrl_issuer"),
+        F.col("t.bin_issuer_name").alias("test_issuer"),
+        F.col("c.high_risk").alias("ctrl_high_risk"),
+        F.col("t.high_risk").alias("test_high_risk"),
+        F.col("c.payment_processor").alias("ctrl_processor"),
+        F.col("t.payment_processor").alias("test_processor"),
+        F.col("c.fraud_pre_auth_result").alias("ctrl_fraud"),
+        F.col("t.fraud_pre_auth_result").alias("test_fraud"),
+        F.col("c.challenge_issued").alias("ctrl_challenge"),
+        F.col("t.challenge_issued").alias("test_challenge"),
+        F.col("c.is_customer_attempt_successful").alias("ctrl_success"),
+        F.col("t.is_customer_attempt_successful").alias("test_success"),
+        F.col("c.is_three_ds_passed").alias("ctrl_3ds_passed"),
+        F.col("t.is_three_ds_passed").alias("test_3ds_passed"),
+        F.col("c.payment_attempt_timestamp").alias("ctrl_timestamp"),
+        F.col("t.payment_attempt_timestamp").alias("test_timestamp"),
+        F.col("c.customer_attempt_rank").alias("ctrl_cust_rank"),
+        F.col("t.customer_attempt_rank").alias("test_cust_rank"),
+    ).withColumn(
+        "_rn", F.row_number().over(
+            W.partitionBy("ctrl_ref").orderBy(
+                F.abs(F.col("ctrl_amount") - F.col("test_amount"))
+            )
+        )
+    ).filter(F.col("_rn") == 1).drop("_rn")
+    print(f"Relaxed matched pairs: {pairs.count():,}")
 
 # COMMAND ----------
 
@@ -198,6 +263,127 @@ pairs.groupBy("ctrl_processor").count().orderBy("count", ascending=False).show()
 
 print("--- Processor routing: ctrl vs test ---")
 pairs.groupBy("ctrl_processor", "test_processor").count().orderBy("count", ascending=False).show(20, False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Cell 4b — Card characteristics analysis
+# MAGIC
+# MAGIC Analyze whether Forter's 3DS decision correlates with card-level parameters.
+# MAGIC These pairs are matched on card network, funding type, risk flag, amount bucket, date —
+# MAGIC so any remaining difference is the orchestrator's behavior, not the card profile.
+
+# COMMAND ----------
+
+print("=== CARD CHARACTERISTICS IN MATCHED PAIRS ===\n")
+
+print("--- By account funding type ---")
+pairs.groupBy("account_funding_type").agg(
+    F.count("*").alias("pairs"),
+    F.avg("ctrl_success").alias("ctrl_sr"),
+    F.avg("test_success").alias("test_sr"),
+    (F.avg("test_success") - F.avg("ctrl_success")).alias("sr_delta"),
+).orderBy("pairs", ascending=False).show(10, False)
+
+print("--- By high_risk flag ---")
+if "high_risk" in pairs.columns:
+    pairs.groupBy("high_risk").agg(
+        F.count("*").alias("pairs"),
+        F.avg("ctrl_success").alias("ctrl_sr"),
+        F.avg("test_success").alias("test_sr"),
+        (F.avg("test_success") - F.avg("ctrl_success")).alias("sr_delta"),
+    ).orderBy("pairs", ascending=False).show(10, False)
+elif "ctrl_high_risk" in pairs.columns:
+    pairs.groupBy("ctrl_high_risk", "test_high_risk").agg(
+        F.count("*").alias("pairs"),
+        F.avg("ctrl_success").alias("ctrl_sr"),
+        F.avg("test_success").alias("test_sr"),
+        (F.avg("test_success") - F.avg("ctrl_success")).alias("sr_delta"),
+    ).orderBy("pairs", ascending=False).show(10, False)
+
+print("--- By card network + account funding type ---")
+pairs.groupBy("card_network", "account_funding_type").agg(
+    F.count("*").alias("pairs"),
+    F.avg("ctrl_success").alias("ctrl_sr"),
+    F.avg("test_success").alias("test_sr"),
+    (F.avg("test_success") - F.avg("ctrl_success")).alias("sr_delta"),
+).orderBy("pairs", ascending=False).show(20, False)
+
+print("--- BIN overlap: same BIN6 in ctrl vs test ---")
+same_issuer = pairs.filter(F.col("ctrl_issuer") == F.col("test_issuer"))
+diff_issuer = pairs.filter(F.col("ctrl_issuer") != F.col("test_issuer"))
+print(f"Same issuer:      {same_issuer.count():,} pairs, ctrl SR={same_issuer.select(F.avg('ctrl_success')).first()[0]:.3f}, test SR={same_issuer.select(F.avg('test_success')).first()[0]:.3f}")
+print(f"Different issuer: {diff_issuer.count():,} pairs, ctrl SR={diff_issuer.select(F.avg('ctrl_success')).first()[0]:.3f}, test SR={diff_issuer.select(F.avg('test_success')).first()[0]:.3f}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## Cell 4c — Forter decision analysis (full population, not just pairs)
+# MAGIC
+# MAGIC Compare exemption rates controlling for card characteristics to test the
+# MAGIC hypothesis that Forter gives different 3DS recommendations for similar cards
+# MAGIC depending on the orchestrator path.
+
+# COMMAND ----------
+
+print("=== FORTER EXEMPTION RATE BY CARD CHARACTERISTICS (full segment) ===\n")
+
+exempt_analysis = df_raw.withColumn(
+    "is_exempted", (F.col("fraud_pre_auth_result") == "THREE_DS_EXEMPTION").cast("int")
+).withColumn(
+    "is_3ds", (F.col("fraud_pre_auth_result") == "THREE_DS").cast("int")
+)
+
+print("--- Exemption rate by group × account_funding_type ---")
+exempt_analysis.groupBy("group_name", "bin_account_funding_type").agg(
+    F.count("*").alias("attempts"),
+    F.avg("is_exempted").alias("exemption_rate"),
+    F.avg("is_3ds").alias("three_ds_rate"),
+    F.avg("is_customer_attempt_successful").alias("sr"),
+).orderBy("bin_account_funding_type", "group_name").show(20, False)
+
+print("--- Exemption rate by group × high_risk ---")
+exempt_analysis.groupBy("group_name", "high_risk").agg(
+    F.count("*").alias("attempts"),
+    F.avg("is_exempted").alias("exemption_rate"),
+    F.avg("is_3ds").alias("three_ds_rate"),
+    F.avg("is_customer_attempt_successful").alias("sr"),
+).orderBy("high_risk", "group_name").show(10, False)
+
+print("--- Exemption rate by group × card_network × high_risk ---")
+exempt_analysis.groupBy("group_name", "payment_method_variant", "high_risk").agg(
+    F.count("*").alias("attempts"),
+    F.avg("is_exempted").alias("exemption_rate"),
+    F.avg("is_3ds").alias("three_ds_rate"),
+    F.avg("is_customer_attempt_successful").alias("sr"),
+).orderBy("payment_method_variant", "high_risk", "group_name").show(20, False)
+
+print("--- Exemption rate by group × bin_product_usage_type ---")
+exempt_analysis.groupBy("group_name", "bin_product_usage_type").agg(
+    F.count("*").alias("attempts"),
+    F.avg("is_exempted").alias("exemption_rate"),
+    F.avg("is_3ds").alias("three_ds_rate"),
+    F.avg("is_customer_attempt_successful").alias("sr"),
+).orderBy("bin_product_usage_type", "group_name").show(20, False)
+
+print("--- Top BIN6 with largest exemption rate difference ---")
+bin_diff = exempt_analysis.groupBy("bin_issuer_name", "group_name").agg(
+    F.count("*").alias("attempts"),
+    F.avg("is_exempted").alias("exemption_rate"),
+)
+from pyspark.sql.functions import first
+bin_pivot = bin_diff.groupBy("bin_issuer_name").pivot("group_name").agg(
+    F.first("attempts").alias("att"),
+    F.first("exemption_rate").alias("exempt_rate"),
+).filter(
+    (F.col("Control_att") >= 20) & (F.col("Test_att") >= 20)
+).withColumn(
+    "exempt_delta", F.col("Test_exempt_rate") - F.col("Control_exempt_rate")
+).orderBy(F.abs(F.col("exempt_delta")).desc())
+print("Top 20 issuers with largest exemption rate delta (min 20 att each):")
+bin_pivot.show(20, False)
 
 # COMMAND ----------
 
@@ -230,17 +416,28 @@ print(f"  ... same processor: {interesting_same_proc.count():,}")
 
 # COMMAND ----------
 
+DISPLAY_COLS = [
+    "ctrl_ref", "test_ref",
+    "card_network", "currency", "attempt_date",
+    "ctrl_amount", "test_amount",
+    "account_funding_type", "ctrl_issuer", "test_issuer",
+    "ctrl_processor", "test_processor",
+    "ctrl_fraud", "test_fraud",
+    "ctrl_challenge", "test_challenge",
+    "ctrl_success", "test_success",
+    "test_3ds_passed",
+    "ctrl_cust_rank", "test_cust_rank",
+]
+# Add high_risk column(s) depending on strict vs relaxed match
+if "high_risk" in pairs.columns:
+    DISPLAY_COLS.insert(8, "high_risk")
+else:
+    DISPLAY_COLS.insert(8, "ctrl_high_risk")
+    DISPLAY_COLS.insert(9, "test_high_risk")
+
 display(
     interesting.orderBy("attempt_date", "card_network").limit(30).select(
-        "ctrl_ref", "test_ref",
-        "card_network", "currency", "attempt_date",
-        "ctrl_amount", "test_amount",
-        "ctrl_processor", "test_processor",
-        "ctrl_fraud", "test_fraud",
-        "ctrl_challenge", "test_challenge",
-        "ctrl_success", "test_success",
-        "test_3ds_passed",
-        "ctrl_cust_rank", "test_cust_rank",
+        *[c for c in DISPLAY_COLS if c in interesting.columns]
     )
 )
 
@@ -253,15 +450,7 @@ display(
 
 display(
     interesting_same_proc.orderBy("attempt_date", "card_network").limit(30).select(
-        "ctrl_ref", "test_ref",
-        "card_network", "currency", "attempt_date",
-        "ctrl_amount", "test_amount",
-        "ctrl_processor", "test_processor",
-        "ctrl_fraud", "test_fraud",
-        "ctrl_challenge", "test_challenge",
-        "ctrl_success", "test_success",
-        "test_3ds_passed",
-        "ctrl_cust_rank", "test_cust_rank",
+        *[c for c in DISPLAY_COLS if c in interesting_same_proc.columns]
     )
 )
 
@@ -274,15 +463,7 @@ display(
 
 display(
     pairs.orderBy(F.rand()).limit(30).select(
-        "ctrl_ref", "test_ref",
-        "card_network", "currency", "attempt_date",
-        "ctrl_amount", "test_amount",
-        "ctrl_processor", "test_processor",
-        "ctrl_fraud", "test_fraud",
-        "ctrl_challenge", "test_challenge",
-        "ctrl_success", "test_success",
-        "test_3ds_passed",
-        "ctrl_cust_rank", "test_cust_rank",
+        *[c for c in DISPLAY_COLS if c in pairs.columns]
     )
 )
 
